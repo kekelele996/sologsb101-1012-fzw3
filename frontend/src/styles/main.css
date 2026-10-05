@@ -108,6 +108,10 @@ body::before {
   font-weight: 600;
 }
 
+.gb-row-danger > td {
+  background: #fdecea !important;
+}
+
 .gb-table-compact .ant-table-cell {
   padding: 8px 8px !important;
 }

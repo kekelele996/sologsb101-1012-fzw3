@@ -9,7 +9,7 @@ import type {
   CalibrationFilterState,
   ResponseVerdict,
 } from '@/types/calibration';
-import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from '@/types/calibration';
+import { createEmptyCalibrationFilter, effectiveSensitivity, judgeCalibration, sensitivityDelta } from '@/types/calibration';
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
@@ -75,8 +75,10 @@ export const updateCalibration = createAsyncThunk(
   async (payload: { id: string; patch: Partial<Calibration> }) => {
     const existing = await db.calibrations.get(payload.id);
     const instrument = existing ? await db.instruments.get(existing.instrumentId) : undefined;
-    const nextSensitivity = payload.patch.sensitivity ?? existing?.sensitivity ?? 0;
-    const nextNoise = payload.patch.selfNoise ?? existing?.selfNoise ?? 0;
+    // 已补记复检时，响应结论以复检值为准核定
+    const nextSensitivity =
+      existing?.recheckSensitivity ?? payload.patch.sensitivity ?? existing?.sensitivity ?? 0;
+    const nextNoise = existing?.recheckSelfNoise ?? payload.patch.selfNoise ?? existing?.selfNoise ?? 0;
     const verdict = judgeCalibration(instrument?.type ?? '宽频带', nextSensitivity, nextNoise);
     await db.calibrations.update(payload.id, {
       ...payload.patch,
@@ -84,6 +86,37 @@ export const updateCalibration = createAsyncThunk(
       updatedAt: Date.now(),
     } as never);
     return payload;
+  }
+);
+
+/**
+ * 补记野外复检：填入复检日期 / 复检灵敏度 / 复检自噪，
+ * 并按复检值重新核定响应结论（覆盖原结论），使统计与趋势改用复检后的数。
+ */
+export const saveRecheck = createAsyncThunk(
+  'calibration/saveRecheck',
+  async (payload: {
+    id: string;
+    recheckDate: string;
+    recheckSensitivity: number;
+    recheckSelfNoise: number;
+  }) => {
+    const existing = await db.calibrations.get(payload.id);
+    if (!existing) throw new Error('标定记录不存在，无法补记复检');
+    const instrument = await db.instruments.get(existing.instrumentId);
+    const verdict = judgeCalibration(
+      instrument?.type ?? '宽频带',
+      payload.recheckSensitivity,
+      payload.recheckSelfNoise
+    );
+    await db.calibrations.update(payload.id, {
+      recheckDate: payload.recheckDate,
+      recheckSensitivity: payload.recheckSensitivity,
+      recheckSelfNoise: payload.recheckSelfNoise,
+      responseVerdict: verdict,
+      updatedAt: Date.now(),
+    } as never);
+    return { id: payload.id, verdict };
   }
 );
 
@@ -296,8 +329,8 @@ export const selectSensitivityDeltas = (
   grouped.forEach((list) => {
     const sorted = [...list].sort((a, b) => a.date.localeCompare(b.date));
     sorted.forEach((row, index) => {
-      const previous = index > 0 ? sorted[index - 1].sensitivity : null;
-      result[row.id] = sensitivityDelta(row.sensitivity, previous);
+      const previous = index > 0 ? effectiveSensitivity(sorted[index - 1]) : null;
+      result[row.id] = sensitivityDelta(effectiveSensitivity(row), previous);
     });
   });
   return result;

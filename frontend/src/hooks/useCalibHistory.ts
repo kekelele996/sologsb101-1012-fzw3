@@ -7,7 +7,14 @@ import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
-import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
+import {
+  calibrateDueText,
+  effectiveDate,
+  effectiveSelfNoise,
+  effectiveSensitivity,
+  sensitivityDelta,
+  type SensitivityDelta,
+} from '@/types/calibration';
 import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
 import type { Instrument } from '@/types/instrument';
@@ -67,7 +74,10 @@ export function useCalibHistory(): UseCalibHistoryResult {
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = rows.length > 0 ? rows[0] : null;
         const previous = rows.length > 1 ? rows[1] : null;
-        const delta = sensitivityDelta(latest?.sensitivity ?? 0, previous ? previous.sensitivity : null);
+        const delta = sensitivityDelta(
+          latest ? effectiveSensitivity(latest) : 0,
+          previous ? effectiveSensitivity(previous) : null
+        );
         const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
           return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
@@ -87,7 +97,11 @@ export function useCalibHistory(): UseCalibHistoryResult {
           worstVerdict,
           trend: [...rows]
             .reverse()
-            .map((row) => ({ date: row.date, sensitivity: row.sensitivity, selfNoise: row.selfNoise })),
+            .map((row) => ({
+              date: effectiveDate(row),
+              sensitivity: effectiveSensitivity(row),
+              selfNoise: effectiveSelfNoise(row),
+            })),
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);

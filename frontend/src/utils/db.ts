@@ -14,7 +14,7 @@ import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -58,7 +58,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -86,6 +86,21 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+      });
+
+    // v3：标定记录支持补记野外复检（复检日期 / 复检灵敏度 / 复检自噪），
+    // 复检字段为可选字段，历史数据无需回填，仅占位升级。
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations:
+          'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, recheckDate, updatedAt',
+        replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+      })
+      .upgrade(async () => {
+        // 复检字段为可选字段，历史标定记录无需回填；补记时按需写入即可。
       });
   }
 }
@@ -125,6 +140,9 @@ interface SeedCalibration {
   operator: string;
   agency: string;
   remark: string;
+  recheckDate?: string;
+  recheckSensitivity?: number;
+  recheckSelfNoise?: number;
 }
 
 interface SeedInstrument {
@@ -297,6 +315,16 @@ export async function seedDemoData(): Promise<void> {
                   agency: '省地震局计量站',
                   remark: '自噪超标，判定不合格',
                 },
+                {
+                  id: 'cal_ltx02_st_2',
+                  instrumentId: 'ins_ltx02_st',
+                  date: '2024-03-15',
+                  sensitivity: 268.6,
+                  selfNoise: 4.5,
+                  operator: '周渝',
+                  agency: '省地震局计量站',
+                  remark: '复检后自噪仍超标，连续两次不合格',
+                },
               ],
             },
           ],
@@ -439,7 +467,10 @@ export async function seedDemoData(): Promise<void> {
                   selfNoise: 3.9,
                   operator: '林之遥',
                   agency: '国家测震台网计量中心',
-                  remark: '自噪接近上限，判定不合格',
+                  remark: '自噪接近上限，初次判定不合格',
+                  recheckDate: '2023-07-20',
+                  recheckSensitivity: 1392.6,
+                  recheckSelfNoise: 2.0,
                 },
               ],
             },
@@ -517,8 +548,8 @@ export async function seedDemoData(): Promise<void> {
             calibrations.forEach((calibrationSeed, calibrationIndex) => {
               const verdict = judgeCalibration(
                 instrumentRest.type,
-                calibrationSeed.sensitivity,
-                calibrationSeed.selfNoise
+                calibrationSeed.recheckSensitivity ?? calibrationSeed.sensitivity,
+                calibrationSeed.recheckSelfNoise ?? calibrationSeed.selfNoise
               );
               calibrationRows.push({
                 ...calibrationSeed,

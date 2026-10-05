@@ -22,6 +22,12 @@ export interface Calibration {
   agency: string;
   /** 备注 */
   remark: string;
+  /** 复检日期（野外复检补记，补记后响应结论与统计以复检值为准） */
+  recheckDate?: string;
+  /** 复检灵敏度（V·s/m） */
+  recheckSensitivity?: number;
+  /** 复检自噪（m/s² 或 counts，按台网口径记录） */
+  recheckSelfNoise?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -66,6 +72,33 @@ export function sensitivityDelta(current: number, previous: number | null): Sens
   }
   const absolute = Number((current - previous).toFixed(2));
   return { absolute, percent: Number(((absolute / previous) * 100).toFixed(2)), comparable: true };
+}
+
+/** 该标定是否已补记复检（日期、灵敏度、自噪三项齐全） */
+export function hasRecheck(row: Calibration): boolean {
+  return (
+    typeof row.recheckDate === 'string' &&
+    row.recheckDate.length > 0 &&
+    typeof row.recheckSensitivity === 'number' &&
+    Number.isFinite(row.recheckSensitivity) &&
+    typeof row.recheckSelfNoise === 'number' &&
+    Number.isFinite(row.recheckSelfNoise)
+  );
+}
+
+/** 生效灵敏度：已补记复检取复检灵敏度，否则取初次录入值 */
+export function effectiveSensitivity(row: Calibration): number {
+  return hasRecheck(row) ? (row.recheckSensitivity as number) : row.sensitivity;
+}
+
+/** 生效自噪：已补记复检取复检自噪，否则取初次录入值 */
+export function effectiveSelfNoise(row: Calibration): number {
+  return hasRecheck(row) ? (row.recheckSelfNoise as number) : row.selfNoise;
+}
+
+/** 生效日期：已补记复检取复检日期（趋势按复检后落点），否则取标定日期 */
+export function effectiveDate(row: Calibration): string {
+  return hasRecheck(row) ? (row.recheckDate as string) : row.date;
 }
 
 /** 标定页筛选条件（存于 calibrationSlice） */
