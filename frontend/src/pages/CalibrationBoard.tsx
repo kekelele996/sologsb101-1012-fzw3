@@ -1,6 +1,7 @@
 /**
  * 模块 3：/calibrations 标定记录台
- * 录入灵敏度 / 自噪 / 脉冲响应结论并批量改结论，叠加多次标定并绘出灵敏度趋势。
+ * 录入灵敏度 / 自噪并自动初判，初录即定死；每条标定可补记一次野外复检，
+ * 补记后响应结论、灵敏度变化、顶部计数与灵敏度趋势一律改用复检后的数。
  * 复用 <FilterBar>、<QualifyTag>、<EmptyPanel>。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -21,9 +22,16 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  CheckCircleOutlined,
+  DeleteOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  SafetyCertificateOutlined,
+} from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
@@ -38,16 +46,20 @@ import {
   createCalibration,
   patchFilter,
   removeCalibration,
+  removeCalibrationRecheck,
   resetFilter,
+  saveCalibrationRecheck,
   selectCalibrationFilter,
   selectCalibrations,
-  updateCalibration,
 } from '@/stores/calibrationSlice';
 import {
   RESPONSE_VERDICTS,
   SELF_NOISE_LIMIT,
   SENSITIVITY_RANGE,
-  createEmptyCalibrationFilter,
+  effectiveDate,
+  effectiveSelfNoise,
+  effectiveSensitivity,
+  effectiveVerdict,
   judgeCalibration,
   sensitivityDelta,
   type Calibration,
@@ -62,13 +74,18 @@ interface CalibrationFormValues {
   date: dayjs.Dayjs | null;
   sensitivity: number;
   selfNoise: number;
-  responseVerdict: ResponseVerdict;
   operator: string;
   agency: string;
   remark: string;
 }
 
-/** 标定行：附带仪器、台站、台阵信息与灵敏度变化 */
+interface RecheckFormValues {
+  date: dayjs.Dayjs | null;
+  sensitivity: number;
+  selfNoise: number;
+}
+
+/** 标定行：附带仪器、台站、台阵信息与灵敏度变化（均取复检后的生效值） */
 interface CalibrationRow {
   row: Calibration;
   instrumentModel: string;
@@ -77,6 +94,10 @@ interface CalibrationRow {
   stationCode: string;
   arrayName: string;
   arrayId: string;
+  effectiveDate: string;
+  effectiveSensitivity: number;
+  effectiveSelfNoise: number;
+  effectiveVerdict: ResponseVerdict;
   delta: ReturnType<typeof sensitivityDelta>;
 }
 
@@ -93,11 +114,15 @@ export default function CalibrationBoard() {
   const filter = useAppSelector(selectCalibrationFilter);
 
   const [modalOpen, setModalOpen] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const [recheckModalOpen, setRecheckModalOpen] = useState(false);
+  const [recheckTarget, setRecheckTarget] = useState<Calibration | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const [trendInstrumentId, setTrendInstrumentId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<CalibrationFormValues>();
+  const [recheckForm] = Form.useForm<RecheckFormValues>();
+  const recheckSensitivity = Form.useWatch('sensitivity', recheckForm) as number | undefined;
+  const recheckNoise = Form.useWatch('selfNoise', recheckForm) as number | undefined;
 
   useEffect(() => {
     dispatch(
@@ -132,7 +157,7 @@ export default function CalibrationBoard() {
     return map;
   }, [arrays, instruments, stations]);
 
-  /** 逐仪器排序后的标定序列，用于计算灵敏度变化 */
+  /** 逐仪器排序后的标定序列，灵敏度变化一律采用复检后的生效值 */
   const deltaIndex = useMemo(() => {
     const grouped = new Map<string, Calibration[]>();
     calibrations.forEach((row) => {
@@ -144,7 +169,8 @@ export default function CalibrationBoard() {
     grouped.forEach((list) => {
       const sorted = [...list].sort((a, b) => a.date.localeCompare(b.date));
       sorted.forEach((row, index) => {
-        result.set(row.id, sensitivityDelta(row.sensitivity, index > 0 ? sorted[index - 1].sensitivity : null));
+        const previous = index > 0 ? effectiveSensitivity(sorted[index - 1]) : null;
+        result.set(row.id, sensitivityDelta(effectiveSensitivity(row), previous));
       });
     });
     return result;
@@ -162,7 +188,11 @@ export default function CalibrationBoard() {
           stationCode: info?.stationCode ?? '—',
           arrayName: info?.arrayName ?? '—',
           arrayId: info?.arrayId ?? '',
-          delta: deltaIndex.get(row.id) ?? sensitivityDelta(row.sensitivity, null),
+          effectiveDate: effectiveDate(row),
+          effectiveSensitivity: effectiveSensitivity(row),
+          effectiveSelfNoise: effectiveSelfNoise(row),
+          effectiveVerdict: effectiveVerdict(row),
+          delta: deltaIndex.get(row.id) ?? sensitivityDelta(effectiveSensitivity(row), null),
         };
       })
       .filter((item) => {
@@ -171,28 +201,28 @@ export default function CalibrationBoard() {
           const haystack = `${item.instrumentModel}${item.serialNo}${item.stationCode}${item.arrayName}${item.row.operator}${item.row.agency}`;
           if (!haystack.includes(keyword)) return false;
         }
-        if (filter.verdicts.length > 0 && !filter.verdicts.includes(item.row.responseVerdict)) return false;
+        if (filter.verdicts.length > 0 && !filter.verdicts.includes(item.effectiveVerdict)) return false;
         if (filter.instrumentTypes.length > 0 && !filter.instrumentTypes.includes(item.instrumentType)) return false;
-        if (filter.onlyOverdue && item.row.responseVerdict !== '不合格') return false;
+        if (filter.onlyOverdue && item.effectiveVerdict !== '不合格') return false;
         return true;
       })
-      .sort((a, b) => b.row.date.localeCompare(a.row.date));
+      .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
   }, [calibrations, deltaIndex, filter, instrumentIndex]);
 
   const totals = useMemo(() => {
-    const unqualified = rows.filter((item) => item.row.responseVerdict === '不合格').length;
+    const unqualified = rows.filter((item) => item.effectiveVerdict === '不合格').length;
     const meanSensitivity =
-      rows.length === 0
-        ? 0
-        : round(rows.reduce((sum, item) => sum + item.row.sensitivity, 0) / rows.length, 1);
+      rows.length === 0 ? 0 : round(rows.reduce((sum, item) => sum + item.effectiveSensitivity, 0) / rows.length, 1);
     const meanNoise =
-      rows.length === 0 ? 0 : round(rows.reduce((sum, item) => sum + item.row.selfNoise, 0) / rows.length, 2);
+      rows.length === 0 ? 0 : round(rows.reduce((sum, item) => sum + item.effectiveSelfNoise, 0) / rows.length, 2);
+    const rechecked = rows.filter((item) => item.row.recheck).length;
     return {
       count: rows.length,
       unqualified,
       qualifyRate: rows.length === 0 ? 0 : round(((rows.length - unqualified) / rows.length) * 100, 1),
       meanSensitivity,
       meanNoise,
+      rechecked,
       operatorCount: new Set(rows.map((item) => item.row.operator)).size,
     };
   }, [rows]);
@@ -215,7 +245,6 @@ export default function CalibrationBoard() {
   }, [calibrations, rows, trendInstrumentId]);
 
   const openCreate = () => {
-    setEditingId(null);
     const firstInstrument = instruments[0];
     const type = (firstInstrument?.type ?? '宽频带') as InstrumentType;
     const range = SENSITIVITY_RANGE[type];
@@ -224,7 +253,6 @@ export default function CalibrationBoard() {
       date: dayjs(),
       sensitivity: round((range.min + range.max) / 2, 2),
       selfNoise: 1.5,
-      responseVerdict: '合格',
       operator: '陈立群',
       agency: '省地震局计量站',
       remark: '',
@@ -232,19 +260,23 @@ export default function CalibrationBoard() {
     setModalOpen(true);
   };
 
-  const openEdit = (row: Calibration) => {
-    setEditingId(row.id);
-    form.setFieldsValue({
-      instrumentId: row.instrumentId,
-      date: dayjs(row.date),
-      sensitivity: row.sensitivity,
-      selfNoise: row.selfNoise,
-      responseVerdict: row.responseVerdict,
-      operator: row.operator,
-      agency: row.agency,
-      remark: row.remark,
-    });
-    setModalOpen(true);
+  /** 打开复检弹窗：已复检则回填复检数据（修改当次复检），未复检则给默认值 */
+  const openRecheck = (row: Calibration) => {
+    setRecheckTarget(row);
+    recheckForm.setFieldsValue(
+      row.recheck
+        ? {
+            date: dayjs(row.recheck.date),
+            sensitivity: row.recheck.sensitivity,
+            selfNoise: row.recheck.selfNoise,
+          }
+        : {
+            date: dayjs(),
+            sensitivity: row.sensitivity,
+            selfNoise: row.selfNoise,
+          }
+    );
+    setRecheckModalOpen(true);
   };
 
   const submit = async () => {
@@ -256,21 +288,41 @@ export default function CalibrationBoard() {
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
         sensitivity: Number(values.sensitivity),
         selfNoise: Number(values.selfNoise),
-        responseVerdict: values.responseVerdict,
         operator: values.operator.trim(),
         agency: values.agency?.trim() ?? '',
         remark: values.remark?.trim() ?? '',
       };
-      if (editingId) {
-        await dispatch(updateCalibration({ id: editingId, patch: payload })).unwrap();
-        message.success('标定记录已更新，结论已按灵敏度与自噪重新核定');
-      } else {
-        await dispatch(createCalibration(payload)).unwrap();
-        const instrument = instruments.find((row) => row.id === payload.instrumentId);
-        const verdict = judgeCalibration(instrument?.type ?? '宽频带', payload.sensitivity, payload.selfNoise);
-        message.success(`标定记录已保存，自动初判为「${verdict}」`);
-      }
+      await dispatch(createCalibration(payload)).unwrap();
+      const instrument = instruments.find((row) => row.id === payload.instrumentId);
+      const verdict = judgeCalibration(instrument?.type ?? '宽频带', payload.sensitivity, payload.selfNoise);
+      message.success(`标定记录已保存，自动初判为「${verdict}」，后续可补记一次野外复检`);
       setModalOpen(false);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const submitRecheck = async () => {
+    if (!recheckTarget) return;
+    const values = await recheckForm.validateFields();
+    setSubmitting(true);
+    try {
+      const result = await dispatch(
+        saveCalibrationRecheck({
+          id: recheckTarget.id,
+          recheck: {
+            date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+            sensitivity: Number(values.sensitivity),
+            selfNoise: Number(values.selfNoise),
+          },
+        })
+      ).unwrap();
+      message.success(
+        `复检已保存，该记录的响应结论核定为「${result.verdict}」，统计与趋势已改用复检数据`
+      );
+      setRecheckModalOpen(false);
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '复检保存失败');
     } finally {
       setSubmitting(false);
     }
@@ -281,8 +333,12 @@ export default function CalibrationBoard() {
       message.warning('请先勾选要批量改结论的记录');
       return;
     }
-    await dispatch(bulkSetVerdict({ ids: selectedKeys, verdict })).unwrap();
-    message.success(`已将 ${selectedKeys.length} 条标定记录的响应结论改为「${verdict}」`);
+    const result = await dispatch(bulkSetVerdict({ ids: selectedKeys, verdict })).unwrap();
+    message.success(
+      result.skipped > 0
+        ? `已改判 ${result.updated} 条；${result.skipped} 条已补记复检，以复检结论为准未改动`
+        : `已将 ${result.updated} 条标定记录的响应结论改为「${verdict}」`
+    );
     setSelectedKeys([]);
   };
 
@@ -309,13 +365,34 @@ export default function CalibrationBoard() {
     setSearchParams(new URLSearchParams(), { replace: true });
   };
 
-  /** 灵敏度趋势图坐标 */
+  /** 复检录入时的实时核定预览 */
+  const recheckPreview = (): ResponseVerdict | null => {
+    if (!recheckTarget) return null;
+    if (typeof recheckSensitivity !== 'number' || typeof recheckNoise !== 'number') return null;
+    const instrument = instruments.find((row) => row.id === recheckTarget.instrumentId);
+    return judgeCalibration(instrument?.type ?? '宽频带', Number(recheckSensitivity), Number(recheckNoise));
+  };
+
+  /** 灵敏度趋势图坐标（采用复检后的生效灵敏度） */
   const trendChart = useMemo(() => {
     const points = trendRows.points;
     if (points.length === 0) {
-      return { line: '', dots: [] as Array<{ id: string; cx: number; cy: number; date: string; sensitivity: number }>, min: 0, max: 0 };
+      return {
+        line: '',
+        dots: [] as Array<{
+          id: string;
+          cx: number;
+          cy: number;
+          date: string;
+          effectiveDate: string;
+          sensitivity: number;
+          rechecked: boolean;
+        }>,
+        min: 0,
+        max: 0,
+      };
     }
-    const sensitivities = points.map((row) => row.sensitivity);
+    const sensitivities = points.map((row) => effectiveSensitivity(row));
     const min = Math.min(...sensitivities) * 0.98;
     const max = Math.max(...sensitivities) * 1.02;
     const left = 58;
@@ -326,13 +403,18 @@ export default function CalibrationBoard() {
       points.length === 1 ? (left + right) / 2 : left + (index * (right - left)) / (points.length - 1);
     const toY = (value: number): number =>
       max - min < 1e-6 ? (top + bottom) / 2 : bottom - ((value - min) / (max - min)) * (bottom - top);
-    const dots = points.map((row, index) => ({
-      id: row.id,
-      cx: Number(toX(index).toFixed(1)),
-      cy: Number(toY(row.sensitivity).toFixed(1)),
-      date: row.date,
-      sensitivity: row.sensitivity,
-    }));
+    const dots = points.map((row, index) => {
+      const sensitivity = effectiveSensitivity(row);
+      return {
+        id: row.id,
+        cx: Number(toX(index).toFixed(1)),
+        cy: Number(toY(sensitivity).toFixed(1)),
+        date: row.date,
+        effectiveDate: effectiveDate(row),
+        sensitivity,
+        rechecked: !!row.recheck,
+      };
+    });
     return { line: dots.map((dot) => `${dot.cx},${dot.cy}`).join(' '), dots, min, max };
   }, [trendRows]);
 
@@ -346,8 +428,9 @@ export default function CalibrationBoard() {
             标定记录台
           </Typography.Title>
           <p className="gb-hint">
-            录入灵敏度、自噪与脉冲响应结论，系统按类型灵敏度区间（宽频带 {SENSITIVITY_RANGE.宽频带.min} ~{' '}
-            {SENSITIVITY_RANGE.宽频带.max}）与自噪限值（{SELF_NOISE_LIMIT}）自动初判；可勾选批量改结论。
+            初录灵敏度与自噪后系统按类型区间（宽频带 {SENSITIVITY_RANGE.宽频带.min} ~{' '}
+            {SENSITIVITY_RANGE.宽频带.max}）与自噪限值（{SELF_NOISE_LIMIT}）自动初判，录完即定死；每条标定可补记
+            <b>一次野外复检</b>，复检保存后响应结论、灵敏度变化与下方统计、趋势一律按复检数据计算。
           </p>
         </div>
         <Space wrap>
@@ -371,6 +454,12 @@ export default function CalibrationBoard() {
         <StatBadge label="合格率" value={totals.qualifyRate} percent={totals.qualifyRate} tone="success" />
         <StatBadge label="平均灵敏度" value={totals.meanSensitivity} suffix="V·s/m" tone="info" />
         <StatBadge label="平均自噪" value={totals.meanNoise} suffix="" tone="warning" />
+        <StatBadge
+          label="已补记复检"
+          value={totals.rechecked}
+          suffix={`/ ${totals.count} 次`}
+          tone={totals.rechecked > 0 ? 'info' : 'default'}
+        />
         <StatBadge label="标定人" value={totals.operatorCount} suffix="人" tone="default" />
       </div>
 
@@ -396,7 +485,7 @@ export default function CalibrationBoard() {
         onReset={handleReset}
         extra={
           <Space size={6}>
-            <span className="gb-hint">批量改结论：</span>
+            <span className="gb-hint">批量改结论（复检记录自动跳过）：</span>
             {RESPONSE_VERDICTS.map((verdict) => (
               <Button key={verdict} size="small" onClick={() => void handleBulkVerdict(verdict)}>
                 {verdict}
@@ -409,7 +498,7 @@ export default function CalibrationBoard() {
       {rows.length === 0 ? (
         <EmptyPanel
           title={calibrations.length === 0 ? '还没有标定记录' : '没有符合条件的标定记录'}
-          description="先到「台站仪器」页登记仪器，再按次录入灵敏度与自噪，即可形成可追溯的标定台账。"
+          description="先到「台站仪器」页登记仪器，再按次录入灵敏度与自噪，即可形成可追溯的标定台账；野外复检回来后可为每条记录补记一次复检。"
           actionText="新增标定记录"
           secondaryText="重置筛选"
           onAction={openCreate}
@@ -424,6 +513,7 @@ export default function CalibrationBoard() {
           rowSelection={{
             selectedRowKeys: selectedKeys,
             onChange: (keys) => setSelectedKeys(keys as string[]),
+            getCheckboxProps: (item: CalibrationRow) => ({ disabled: !!item.row.recheck }),
           }}
           columns={[
             {
@@ -448,14 +538,42 @@ export default function CalibrationBoard() {
                 </div>
               ),
             },
-            { title: '标定日期', dataIndex: ['row', 'date'], width: 120, className: 'gb-mono' },
+            {
+              title: '标定 / 复检日期',
+              width: 150,
+              render: (_: unknown, item: CalibrationRow) => (
+                <div>
+                  <div className="gb-mono">{item.row.date}</div>
+                  {item.row.recheck ? (
+                    <Tooltip title="已补记野外复检，结论与统计按复检日期生效">
+                      <div className="gb-hint">
+                        <SafetyCertificateOutlined /> 复检 {item.row.recheck.date}
+                      </div>
+                    </Tooltip>
+                  ) : (
+                    <div className="gb-hint">未复检</div>
+                  )}
+                </div>
+              ),
+            },
             {
               title: '灵敏度 (V·s/m)',
-              width: 150,
+              width: 170,
               align: 'right',
               render: (_: unknown, item: CalibrationRow) => (
                 <div>
-                  <span className="gb-mono">{item.row.sensitivity}</span>
+                  <Tooltip
+                    title={
+                      item.row.recheck
+                        ? `初录 ${item.row.sensitivity}，复检 ${item.row.recheck.sensitivity}，变化按复检值计算`
+                        : '初录值（尚未复检）'
+                    }
+                  >
+                    <span className={item.row.recheck ? 'gb-mono' : 'gb-mono'}>
+                      {item.effectiveSensitivity}
+                      {item.row.recheck ? <Tag color="blue" style={{ marginInlineStart: 4 }}>复检</Tag> : null}
+                    </span>
+                  </Tooltip>
                   {item.delta.comparable ? (
                     <div className={Math.abs(item.delta.percent) > 5 ? 'gb-danger gb-hint' : 'gb-hint'}>
                       变化 {item.delta.absolute > 0 ? '+' : ''}
@@ -472,21 +590,28 @@ export default function CalibrationBoard() {
               width: 100,
               align: 'right',
               render: (_: unknown, item: CalibrationRow) => (
-                <span className={item.row.selfNoise > SELF_NOISE_LIMIT ? 'gb-danger gb-mono' : 'gb-mono'}>
-                  {item.row.selfNoise}
-                </span>
+                <Tooltip title={item.row.recheck ? `初录 ${item.row.selfNoise}，复检 ${item.row.recheck.selfNoise}` : '初录值（尚未复检）'}>
+                  <span className={item.effectiveSelfNoise > SELF_NOISE_LIMIT ? 'gb-danger gb-mono' : 'gb-mono'}>
+                    {item.effectiveSelfNoise}
+                  </span>
+                </Tooltip>
               ),
             },
             {
               title: '响应结论',
               width: 190,
               render: (_: unknown, item: CalibrationRow) => (
-                <QualifyTag
-                  verdict={item.row.responseVerdict}
-                  sensitivity={item.row.sensitivity}
-                  selfNoise={item.row.selfNoise}
-                  size="small"
-                />
+                <div>
+                  <QualifyTag
+                    verdict={item.effectiveVerdict}
+                    sensitivity={item.effectiveSensitivity}
+                    selfNoise={item.effectiveSelfNoise}
+                    size="small"
+                  />
+                  {item.row.recheck && item.row.responseVerdict !== item.effectiveVerdict ? (
+                    <div className="gb-hint">初判「{item.row.responseVerdict}」已改判</div>
+                  ) : null}
+                </div>
               ),
             },
             {
@@ -502,15 +627,39 @@ export default function CalibrationBoard() {
             { title: '备注', dataIndex: ['row', 'remark'], ellipsis: true },
             {
               title: '操作',
-              width: 190,
+              width: 210,
               render: (_: unknown, item: CalibrationRow) => (
-                <Space size={6}>
+                <Space size={6} wrap>
                   <Button size="small" onClick={() => setTrendInstrumentId(item.row.instrumentId)}>
                     趋势
                   </Button>
-                  <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(item.row)}>
-                    编辑
-                  </Button>
+                  {item.row.recheck ? (
+                    <>
+                      <Button size="small" type="primary" ghost icon={<CheckCircleOutlined />} onClick={() => openRecheck(item.row)}>
+                        改复检
+                      </Button>
+                      <Popconfirm
+                        title="删除复检数据"
+                        description="删除后该记录恢复为初录结论与初录数值，确认？"
+                        okText="删除复检"
+                        cancelText="取消"
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() =>
+                          void dispatch(removeCalibrationRecheck(item.row.id))
+                            .unwrap()
+                            .then(() => message.success('复检已删除，结论恢复为初录初判'))
+                        }
+                      >
+                        <Button size="small" danger>
+                          撤复检
+                        </Button>
+                      </Popconfirm>
+                    </>
+                  ) : (
+                    <Button size="small" type="primary" icon={<SafetyCertificateOutlined />} onClick={() => openRecheck(item.row)}>
+                      补记复检
+                    </Button>
+                  )}
                   <Popconfirm
                     title="删除标定记录"
                     description={`确认删除 ${item.row.date} 的标定记录？`}
@@ -537,7 +686,12 @@ export default function CalibrationBoard() {
       <Card
         className="gb-panel"
         size="small"
-        title="灵敏度趋势"
+        title={
+          <Space size={8}>
+            <span>灵敏度趋势</span>
+            <span className="gb-hint">（复检后的生效值）</span>
+          </Space>
+        }
         extra={
           <Select
             style={{ width: 260 }}
@@ -567,7 +721,21 @@ export default function CalibrationBoard() {
               <polyline points={trendChart.line} fill="none" stroke="#1e3a5f" strokeWidth="2" />
               {trendChart.dots.map((dot) => (
                 <g key={dot.id}>
-                  <circle cx={dot.cx} cy={dot.cy} r="4.5" fill="#7fd1e8" stroke="#1e3a5f" />
+                  <Tooltip
+                    title={
+                      dot.rechecked
+                        ? `标定 ${dot.date} / 复检 ${dot.effectiveDate}：${dot.sensitivity} V·s/m（复检值）`
+                        : `标定 ${dot.date}：${dot.sensitivity} V·s/m`
+                    }
+                  >
+                    <circle
+                      cx={dot.cx}
+                      cy={dot.cy}
+                      r="4.5"
+                      fill={dot.rechecked ? '#f0a13b' : '#7fd1e8'}
+                      stroke="#1e3a5f"
+                    />
+                  </Tooltip>
                   <text x={dot.cx - 22} y={220 - 4} className="gb-chart-axis">
                     {dot.date.slice(2)}
                   </text>
@@ -575,15 +743,15 @@ export default function CalibrationBoard() {
               ))}
             </svg>
             <p className="gb-hint">
-              纵轴为灵敏度（V·s/m），横轴为标定日期；共 {trendChart.dots.length} 次标定。灵敏度变化超过 5%
-              会以红色提示，供判断仪器漂移趋势。
+              纵轴为灵敏度（V·s/m，复检后取复检值），横轴按初录标定日期排列；橙色点表示已补记复检，悬停可查看复检日期。共{' '}
+              {trendChart.dots.length} 次标定，灵敏度变化超过 5% 以红色提示，供判断仪器漂移趋势。
             </p>
           </>
         )}
       </Card>
 
       <p className="gb-hint">
-        需要处理超期或不合格仪器？前往
+        需要处理超期、复检不合格或连续两次不合格的仪器？前往
         <Button type="link" size="small" onClick={() => navigate('/replacements')}>
           合格评定与更换
         </Button>
@@ -592,11 +760,11 @@ export default function CalibrationBoard() {
 
       <Modal
         open={modalOpen}
-        title={editingId ? '编辑标定记录' : '新增标定记录'}
+        title="新增标定记录"
         onCancel={() => setModalOpen(false)}
         onOk={() => void submit()}
         confirmLoading={submitting}
-        okText={editingId ? '保存修改' : '保存并初判'}
+        okText="保存并初判"
         width={640}
         destroyOnClose
       >
@@ -626,8 +794,8 @@ export default function CalibrationBoard() {
               </Form.Item>
             </Col>
             <Col span={12}>
-              <Form.Item name="responseVerdict" label="脉冲响应结论" rules={[{ required: true }]}>
-                <Select options={RESPONSE_VERDICTS.map((verdict) => ({ label: verdict, value: verdict }))} />
+              <Form.Item name="operator" label="标定人" rules={[{ required: true, message: '请填写标定人' }]}>
+                <Input maxLength={20} placeholder="如：陈立群" />
               </Form.Item>
             </Col>
           </Row>
@@ -643,23 +811,94 @@ export default function CalibrationBoard() {
               </Form.Item>
             </Col>
           </Row>
-          <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item name="operator" label="标定人" rules={[{ required: true, message: '请填写标定人' }]}>
-                <Input maxLength={20} placeholder="如：陈立群" />
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="agency" label="标定机构">
-                <Input maxLength={40} placeholder="如：省地震局计量站" />
-              </Form.Item>
-            </Col>
-          </Row>
+          <Form.Item name="agency" label="标定机构">
+            <Input maxLength={40} placeholder="如：省地震局计量站" />
+          </Form.Item>
+          <Form.Item
+            label="脉冲响应结论"
+            tooltip="初录时由系统按灵敏度区间与自噪限值自动初判，录完即定死；野外复检回来后可补记一次复检改判。"
+          >
+            <span className="gb-hint">保存后按灵敏度与自噪自动初判，无需手工选择</span>
+          </Form.Item>
           <Form.Item name="remark" label="备注">
             <Input.TextArea rows={2} maxLength={100} placeholder="如：响应曲线平滑 / 自噪接近上限" />
           </Form.Item>
         </Form>
       </Modal>
+
+      <Modal
+        open={recheckModalOpen}
+        title={recheckTarget?.recheck ? '修改野外复检' : '补记野外复检'}
+        onCancel={() => setRecheckModalOpen(false)}
+        onOk={() => void submitRecheck()}
+        confirmLoading={submitting}
+        okText={recheckTarget?.recheck ? '保存复检修改' : '保存复检并改判'}
+        width={560}
+        destroyOnClose
+      >
+        {recheckTarget ? (
+          <Form form={recheckForm} layout="vertical" preserve={false}>
+            <p className="gb-hint">
+              仪器：{instrumentIndex.get(recheckTarget.instrumentId)?.model}（
+              {instrumentIndex.get(recheckTarget.instrumentId)?.serialNo}）；初录标定 {recheckTarget.date}，初录灵敏度{' '}
+              {recheckTarget.sensitivity} V·s/m、自噪 {recheckTarget.selfNoise}，初判「{recheckTarget.responseVerdict}
+              」。每条标定仅可补记一次复检。
+            </p>
+            <Row gutter={12}>
+              <Col span={12}>
+                <Form.Item
+                  name="date"
+                  label="复检日期"
+                  rules={[
+                    { required: true, message: '请选择复检日期' },
+                    {
+                      validator: (_: unknown, value: dayjs.Dayjs | null) =>
+                        value && value.format('YYYY-MM-DD') < recheckTarget.date
+                          ? Promise.reject(new Error('复检日期不能早于标定日期'))
+                          : Promise.resolve(),
+                    },
+                  ]}
+                >
+                  <DatePicker
+                    style={{ width: '100%' }}
+                    disabledDate={(current) => current.isBefore(dayjs(recheckTarget.date), 'day')}
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={12}>
+              <Col span={12}>
+                <Form.Item name="sensitivity" label="复检灵敏度 (V·s/m)" rules={[{ required: true }]}>
+                  <InputNumber min={0} max={100000} step={0.01} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item name="selfNoise" label={`复检自噪（限值 ${SELF_NOISE_LIMIT}）`} rules={[{ required: true }]}>
+                  <InputNumber min={0} max={100} step={0.01} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <RecheckVerdictPreview preview={recheckPreview()} />
+            <p className="gb-hint">
+              保存后该记录的响应结论、灵敏度变化、顶部合格率 / 平均灵敏度与灵敏度趋势均改用复检数据；连续两次复检
+              / 标定结论不合格的仪器会在「合格评定与更换」页提示整机更换。
+            </p>
+          </Form>
+        ) : null}
+      </Modal>
+    </div>
+  );
+}
+
+/** 复检实时核定预览（随表单数值变化刷新） */
+function RecheckVerdictPreview({ preview }: { preview: ResponseVerdict | null }) {
+  if (!preview) return null;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <QualifyTag verdict={preview} size="small" />
+      <span className="gb-hint" style={{ marginInlineStart: 8 }}>
+        按复检灵敏度与自噪核定
+      </span>
     </div>
   );
 }

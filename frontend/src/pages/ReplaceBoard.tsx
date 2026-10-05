@@ -21,9 +21,16 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, WarningFilled } from '@ant-design/icons';
+import {
+  DeleteOutlined,
+  EditOutlined,
+  PlusOutlined,
+  SwapOutlined,
+  WarningFilled,
+} from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
@@ -53,6 +60,7 @@ import {
   type ReplaceState,
 } from '@/types/replace';
 import { daysUntilDue, type Instrument } from '@/types/instrument';
+import { effectiveDate, effectiveVerdict } from '@/types/calibration';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
@@ -73,10 +81,17 @@ interface AssessmentRow {
   arrayId: string;
   arrayName: string;
   lastDate: string;
+  /** 最近一次是否已补记复检，以及复检生效日期 */
+  rechecked: boolean;
+  effectiveDate: string | null;
   dueInDays: number;
   overdue: boolean;
   lastVerdict: string;
   calibrationCount: number;
+  /** 最近两次结论都不合格 → 建议整机更换 */
+  suggestReplace: boolean;
+  /** 建议整机更换时，最近两次不合格的生效日期 */
+  failedDates: string[];
   replace: Replace | null;
 }
 
@@ -110,24 +125,32 @@ export default function ReplaceBoard() {
         const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
         const own = calibrations
           .filter((row) => row.instrumentId === instrument.id)
-          .sort((a, b) => b.date.localeCompare(a.date));
-        const latest = own[0];
+          .sort((a, b) => a.date.localeCompare(b.date));
+        const latest = own.length > 0 ? own[own.length - 1] : undefined;
         const lastDate = latest ? latest.date : instrument.installDate;
         const dueInDays = daysUntilDue(lastDate, instrument.installDate);
         const replace =
           replaces
             .filter((row) => row.instrumentId === instrument.id)
             .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
+        // 最近两次标定（复检后的生效结论）均不合格 → 建议整机更换
+        const lastTwo = own.slice(-2);
+        const suggestReplace =
+          lastTwo.length === 2 && lastTwo.every((row) => effectiveVerdict(row) === '不合格');
         return {
           instrument,
           stationCode: station?.code ?? '未知台站',
           arrayId: array?.id ?? '',
           arrayName: array?.name ?? '未知台阵',
           lastDate,
+          rechecked: !!latest?.recheck,
+          effectiveDate: latest ? effectiveDate(latest) : null,
           dueInDays,
           overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
+          lastVerdict: latest ? effectiveVerdict(latest) : '待判定',
           calibrationCount: own.length,
+          suggestReplace,
+          failedDates: suggestReplace ? lastTwo.map((row) => effectiveDate(row)) : [],
           replace,
         };
       })
@@ -150,11 +173,12 @@ export default function ReplaceBoard() {
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
+    const suggestReplace = rows.filter((row) => row.suggestReplace).length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
     const cycleRate =
       rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
+    return { instruments: rows.length, overdue, unqualified, suggestReplace, pendingReplace, closedReplace, cycleRate };
   }, [replaces, rows]);
 
   const replaceRows = useMemo(
@@ -176,9 +200,9 @@ export default function ReplaceBoard() {
     arrayIds: filter.arrayIds,
   };
 
-  const openCreate = (instrumentId?: string) => {
+  const openCreate = (instrumentId?: string, reason?: string) => {
     setEditingId(null);
-    const defaultReason = REPLACE_REASON_TEMPLATES[0].reason;
+    const defaultReason = reason ?? REPLACE_REASON_TEMPLATES[0].reason;
     form.setFieldsValue({
       instrumentId: instrumentId ?? instruments[0]?.id ?? '',
       reason: defaultReason,
@@ -257,6 +281,11 @@ export default function ReplaceBoard() {
   /** 超期仪器提醒（标定周期 365 天） */
   const overdueHistories = histories.filter((history) => history.overdue);
 
+  /** 最近两次结论均不合格、建议整机更换的仪器 */
+  const suggestRows = rows.filter((row) => row.suggestReplace);
+  const suggestReplaceText = (row: AssessmentRow): string =>
+    `最近两次标定结论均不合格：${row.failedDates[0]}、${row.failedDates[1]}（复检后仍不合格取复检日期），建议整机更换`;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div className="gb-brand-bar" />
@@ -289,6 +318,12 @@ export default function ReplaceBoard() {
           suffix="台"
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
         />
+        <StatBadge
+          label="建议整机更换"
+          value={totals.suggestReplace}
+          suffix="台"
+          tone={totals.suggestReplace > 0 ? 'danger' : 'success'}
+        />
         <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
@@ -311,6 +346,25 @@ export default function ReplaceBoard() {
       ) : (
         <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
       )}
+
+      {suggestRows.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          icon={<SwapOutlined />}
+          message={`${suggestRows.length} 台仪器最近两次标定（含复检）结论均不合格，建议整机更换`}
+          description={suggestRows
+            .slice(0, 5)
+            .map((row) => {
+              const text = `${row.arrayName} / ${row.stationCode} · ${row.instrument.model}（${row.instrument.serialNo}）：${suggestReplaceText(row)}`;
+              const action = row.replace
+                ? `，已登记更换（${row.replace.state}）`
+                : '，尚未登记更换';
+              return `${text}${action}`;
+            })
+            .join('；')}
+        />
+      ) : null}
 
       <FilterBar
         modelValue={filterModel}
@@ -346,7 +400,9 @@ export default function ReplaceBoard() {
           className="gb-table-compact"
           dataSource={rows}
           pagination={{ pageSize: 10, showSizeChanger: false }}
-          rowClassName={(row) => (row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : '')}
+          rowClassName={(row) =>
+            row.overdue || row.lastVerdict === '不合格' || row.suggestReplace ? 'gb-row-danger' : ''
+          }
           columns={[
             {
               title: '仪器',
@@ -372,11 +428,17 @@ export default function ReplaceBoard() {
             },
             {
               title: '最近标定',
-              width: 130,
+              width: 150,
               render: (_: unknown, row: AssessmentRow) => (
                 <div>
                   <div className="gb-mono">{row.lastDate}</div>
-                  <div className="gb-hint">{row.calibrationCount} 次记录</div>
+                  {row.rechecked && row.effectiveDate ? (
+                    <Tooltip title="该次标定已补记野外复检，结论按复检日期生效">
+                      <div className="gb-hint">复检 {row.effectiveDate}</div>
+                    </Tooltip>
+                  ) : (
+                    <div className="gb-hint">{row.calibrationCount} 次记录</div>
+                  )}
                 </div>
               ),
             },
@@ -390,9 +452,25 @@ export default function ReplaceBoard() {
               ),
             },
             {
-              title: '标定结论',
-              width: 150,
-              render: (_: unknown, row: AssessmentRow) => <QualifyTag verdict={row.lastVerdict as never} size="small" />,
+              title: '标定结论 / 更换建议',
+              width: 210,
+              render: (_: unknown, row: AssessmentRow) => (
+                <div>
+                  <QualifyTag verdict={row.lastVerdict as never} size="small" />
+                  {row.suggestReplace ? (
+                    <Tooltip title={suggestReplaceText(row)}>
+                      <Tag
+                        color="red"
+                        icon={<SwapOutlined />}
+                        style={{ marginTop: 4, borderRadius: 999, fontWeight: 600 }}
+                      >
+                        建议整机更换
+                      </Tag>
+                      <div className="gb-hint gb-danger">不合格：{row.failedDates.join('、')}</div>
+                    </Tooltip>
+                  ) : null}
+                </div>
+              ),
             },
             {
               title: '仪器状态',
@@ -423,8 +501,20 @@ export default function ReplaceBoard() {
               width: 260,
               render: (_: unknown, row: AssessmentRow) => (
                 <Space size={6}>
-                  <Button size="small" type="primary" onClick={() => openCreate(row.instrument.id)}>
-                    登记更换
+                  <Button
+                    size="small"
+                    type="primary"
+                    danger={row.suggestReplace}
+                    onClick={() =>
+                      openCreate(
+                        row.instrument.id,
+                        row.suggestReplace
+                          ? `最近两次标定（${row.failedDates.join('、')}）结论均不合格，建议整机更换`
+                          : undefined
+                      )
+                    }
+                  >
+                    {row.suggestReplace ? '按建议登记更换' : '登记更换'}
                   </Button>
                   {row.replace ? (
                     <>

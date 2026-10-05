@@ -11,7 +11,8 @@ import {
   stampBackupTime,
   type BackupPayload,
 } from '@/utils/db';
-import type { ResponseVerdict } from '@/types/calibration';
+import type { Calibration, ResponseVerdict } from '@/types/calibration';
+import { effectiveVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
@@ -122,7 +123,13 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
-      await db.calibrations.bulkPut(payload.calibrations);
+      await db.calibrations.bulkPut(
+        payload.calibrations.map(({ recheck, ...rest }) => ({
+          ...rest,
+          // 兼容旧备份：没有复检字段时按 null 处理
+          recheck: recheck ?? null,
+        }))
+      );
       await db.replaces.bulkPut(payload.replaces);
     }
   );
@@ -220,7 +227,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
         : round(distances.reduce((sum, row) => sum + row.km, 0) / distances.length, 3);
 
     const unqualifiedCount = calibrations.filter(
-      (calibration) => calibration.responseVerdict === '不合格'
+      (calibration) => effectiveVerdict(calibration) === '不合格'
     ).length;
     const overdueCount = instruments.filter((instrument) => {
       const rows = calibrations
@@ -272,14 +279,14 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
   });
 }
 
-/** 判定结论统计 */
-export function verdictCounts(calibrations: Array<{ responseVerdict: ResponseVerdict }>): Record<
+/** 判定结论统计（已复检记录按复检结论计） */
+export function verdictCounts(calibrations: Calibration[]): Record<
   ResponseVerdict,
   number
 > {
   const counts: Record<ResponseVerdict, number> = { 合格: 0, 不合格: 0, 待判定: 0 };
   calibrations.forEach((calibration) => {
-    counts[calibration.responseVerdict] += 1;
+    counts[effectiveVerdict(calibration)] += 1;
   });
   return counts;
 }

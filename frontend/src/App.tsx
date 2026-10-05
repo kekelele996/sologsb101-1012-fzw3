@@ -31,6 +31,7 @@ import {
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
+import { effectiveVerdict } from '@/types/calibration';
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -81,7 +82,7 @@ export default function App() {
 
   const currentArray = arrays.find((row) => row.id === currentArrayId) ?? null;
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
-  const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
+  const unqualified = calibrations.filter((row) => effectiveVerdict(row) === '不合格').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
 
   return (

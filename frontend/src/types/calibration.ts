@@ -3,7 +3,19 @@ export type ResponseVerdict = '合格' | '不合格' | '待判定';
 
 export const RESPONSE_VERDICTS: ResponseVerdict[] = ['合格', '不合格', '待判定'];
 
-/** 标定：同一仪器可叠加多次标定记录 */
+/** 野外复检：每条标定最多补记一次，补记后结论/统计/趋势以复检数据为准 */
+export interface RecheckInfo {
+  /** 复检日期 */
+  date: string;
+  /** 复检灵敏度（V·s/m） */
+  sensitivity: number;
+  /** 复检自噪 */
+  selfNoise: number;
+  /** 复检结论（按复检灵敏度与自噪自动核定） */
+  responseVerdict: ResponseVerdict;
+}
+
+/** 标定：同一仪器可叠加多次标定记录；一次标定允许补记一次野外复检 */
 export interface Calibration {
   id: string;
   /** 被标定仪器 */
@@ -14,8 +26,10 @@ export interface Calibration {
   sensitivity: number;
   /** 自噪（m/s² 或 counts，按台网口径记录） */
   selfNoise: number;
-  /** 脉冲响应结论 */
+  /** 脉冲响应结论（初录自动初判；补记复检后以复检结论为准） */
   responseVerdict: ResponseVerdict;
+  /** 野外复检（至多一次，缺省表示尚未复检） */
+  recheck: RecheckInfo | null;
   /** 标定人 */
   operator: string;
   /** 标定机构 */
@@ -24,6 +38,31 @@ export interface Calibration {
   remark: string;
   createdAt: number;
   updatedAt: number;
+}
+
+/** 是否已经补记复检 */
+export function hasRecheck(calibration: Calibration | null | undefined): calibration is Calibration & { recheck: RecheckInfo } {
+  return !!calibration?.recheck;
+}
+
+/** 生效日期：有复检取复检日期，否则取标定日期 */
+export function effectiveDate(calibration: Calibration): string {
+  return calibration.recheck?.date ?? calibration.date;
+}
+
+/** 生效灵敏度：有复检取复检灵敏度 */
+export function effectiveSensitivity(calibration: Calibration): number {
+  return calibration.recheck?.sensitivity ?? calibration.sensitivity;
+}
+
+/** 生效自噪：有复检取复检自噪 */
+export function effectiveSelfNoise(calibration: Calibration): number {
+  return calibration.recheck?.selfNoise ?? calibration.selfNoise;
+}
+
+/** 生效结论：补记复检后以复检结论为准 */
+export function effectiveVerdict(calibration: Calibration): ResponseVerdict {
+  return calibration.recheck?.responseVerdict ?? calibration.responseVerdict;
 }
 
 /**

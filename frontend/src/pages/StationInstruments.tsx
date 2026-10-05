@@ -59,6 +59,7 @@ import {
   updateInstrument,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { effectiveSensitivity, effectiveVerdict } from '@/types/calibration';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
@@ -162,7 +163,7 @@ export default function StationInstruments() {
             instrumentIds.has(calibration.instrumentId)
           );
           const unqualified = stationCalibrations.filter(
-            (calibration) => calibration.responseVerdict === '不合格'
+            (calibration) => effectiveVerdict(calibration) === '不合格'
           ).length;
           const overdue = stationInstruments.filter((instrument) => {
             const own = calibrations
@@ -628,8 +629,8 @@ export default function StationInstruments() {
                     }
                     return (
                       <QualifyTag
-                        verdict={latest.responseVerdict}
-                        sensitivity={round(latest.sensitivity, 2)}
+                        verdict={effectiveVerdict(latest)}
+                        sensitivity={round(effectiveSensitivity(latest), 2)}
                         size="small"
                       />
                     );

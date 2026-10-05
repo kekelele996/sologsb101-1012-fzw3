@@ -47,6 +47,7 @@ import {
 } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { effectiveVerdict } from '@/types/calibration';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
 import { apertureKm, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
@@ -133,7 +134,7 @@ export default function ArrayList() {
           instrumentIds.has(calibration.instrumentId)
         );
         const unqualified = arrayCalibrations.filter(
-          (calibration) => calibration.responseVerdict === '不合格'
+          (calibration) => effectiveVerdict(calibration) === '不合格'
         ).length;
         const pendingReplace = replaces.filter(
           (replace) => instrumentIds.has(replace.instrumentId) && replace.state !== '已复核'

@@ -14,7 +14,7 @@ import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -58,7 +58,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -86,6 +86,25 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+      });
+
+    // v3：标定记录支持补记一次野外复检（recheck 字段），索引无变化
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 历史标定记录补 recheck 字段（null = 尚未复检）
+        await tx
+          .table('calibrations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.recheck === undefined) row.recheck = null;
+          });
       });
   }
 }
@@ -125,6 +144,8 @@ interface SeedCalibration {
   operator: string;
   agency: string;
   remark: string;
+  /** 演示用复检数据（缺省表示未复检） */
+  recheck?: { date: string; sensitivity: number; selfNoise: number; remark?: string };
 }
 
 interface SeedInstrument {
@@ -196,8 +217,8 @@ export async function seedDemoData(): Promise<void> {
               model: 'CMG-3ESPC',
               serialNo: 'CMG-3E-20210418-01',
               installDate: '2021-04-18',
-              state: '在用',
-              remark: '主用宽频带，配 24 位采集器',
+              state: '待标定',
+              remark: '主用宽频带，配 24 位采集器；2024 年野外复检改判不合格',
               calibrations: [
                 {
                   id: 'cal_ltx01_bb_1',
@@ -218,6 +239,12 @@ export async function seedDemoData(): Promise<void> {
                   operator: '陈立群',
                   agency: '省地震局计量站',
                   remark: '灵敏度略降 2.2%，仍在限内',
+                  recheck: {
+                    date: '2024-10-15',
+                    sensitivity: 762.5,
+                    selfNoise: 4.3,
+                    remark: '野外复检灵敏度大幅下滑且自噪超限，结论改用复检值改判不合格',
+                  },
                 },
               ],
             },
@@ -296,6 +323,16 @@ export async function seedDemoData(): Promise<void> {
                   operator: '周渝',
                   agency: '省地震局计量站',
                   remark: '自噪超标，判定不合格',
+                },
+                {
+                  id: 'cal_ltx02_st_2',
+                  instrumentId: 'ins_ltx02_st',
+                  date: '2024-03-06',
+                  sensitivity: 272.6,
+                  selfNoise: 4.6,
+                  operator: '周渝',
+                  agency: '省地震局计量站',
+                  remark: '复标复检仍不合格，连续两次建议整机更换',
                 },
               ],
             },
@@ -515,14 +552,29 @@ export async function seedDemoData(): Promise<void> {
               ...stamp(200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
             });
             calibrations.forEach((calibrationSeed, calibrationIndex) => {
+              const { recheck: seedRecheck, ...calibrationRest } = calibrationSeed;
               const verdict = judgeCalibration(
                 instrumentRest.type,
-                calibrationSeed.sensitivity,
-                calibrationSeed.selfNoise
+                calibrationRest.sensitivity,
+                calibrationRest.selfNoise
               );
+              const recheck = seedRecheck
+                ? {
+                    date: seedRecheck.date,
+                    sensitivity: seedRecheck.sensitivity,
+                    selfNoise: seedRecheck.selfNoise,
+                    responseVerdict: judgeCalibration(
+                      instrumentRest.type,
+                      seedRecheck.sensitivity,
+                      seedRecheck.selfNoise
+                    ),
+                  }
+                : null;
               calibrationRows.push({
-                ...calibrationSeed,
-                responseVerdict: verdict,
+                ...calibrationRest,
+                recheck,
+                remark: recheck && seedRecheck?.remark ? seedRecheck.remark : calibrationRest.remark,
+                responseVerdict: recheck ? recheck.responseVerdict : verdict,
                 ...stamp(
                   400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
                 ),

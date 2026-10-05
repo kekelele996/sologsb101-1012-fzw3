@@ -7,7 +7,7 @@ import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
-import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
+import { calibrateDueText, effectiveDate, effectiveSelfNoise, effectiveSensitivity, effectiveVerdict, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
 import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
 import type { Instrument } from '@/types/instrument';
@@ -34,7 +34,11 @@ export interface InstrumentCalibHistory {
   pending: boolean;
   /** 历次结论中最差的一次 */
   worstVerdict: ResponseVerdict;
-  /** 灵敏度序列（由旧到新），供趋势展示 */
+  /** 最近两次标定（含复检结论）是否均不合格，建议整机更换 */
+  suggestReplace: boolean;
+  /** 建议整机更换时，最近两次不合格标定的日期（复检后仍不合格取复检日期） */
+  failedDates: string[];
+  /** 灵敏度序列（由旧到新），供趋势展示，复检后取复检值与复检日期 */
   trend: Array<{ date: string; sensitivity: number; selfNoise: number }>;
 }
 
@@ -64,20 +68,30 @@ export function useCalibHistory(): UseCalibHistoryResult {
         const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
         const rows = calibrations
           .filter((calibration) => calibration.instrumentId === instrument.id)
-          .sort((a, b) => b.date.localeCompare(a.date));
-        const latest = rows.length > 0 ? rows[0] : null;
-        const previous = rows.length > 1 ? rows[1] : null;
-        const delta = sensitivityDelta(latest?.sensitivity ?? 0, previous ? previous.sensitivity : null);
+          .sort((a, b) => a.date.localeCompare(b.date));
+        const latest = rows.length > 0 ? rows[rows.length - 1] : null;
+        const previous = rows.length > 1 ? rows[rows.length - 2] : null;
+        const delta = sensitivityDelta(
+          latest ? effectiveSensitivity(latest) : 0,
+          previous ? effectiveSensitivity(previous) : null
+        );
+        // 标定周期仍以初录标定日期起算；复检只是对当次结果的复核
         const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
-          return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
+          const verdict = effectiveVerdict(row);
+          return VERDICT_ORDER[verdict] > VERDICT_ORDER[worst] ? verdict : worst;
         }, '合格');
+        // 最近两次标定（按生效结论）都不合格 → 建议整机更换
+        const lastTwo = rows.slice(-2);
+        const suggestReplace =
+          lastTwo.length === 2 && lastTwo.every((row) => effectiveVerdict(row) === '不合格');
+        const failedDates = suggestReplace ? lastTwo.map((row) => effectiveDate(row)) : [];
         return {
           instrument,
           stationCode: station?.code ?? '未知台站',
           arrayId: array?.id ?? station?.arrayId ?? '',
           arrayName: array?.name ?? '未知台阵',
-          calibrations: rows,
+          calibrations: [...rows].reverse(),
           latest,
           delta,
           count: rows.length,
@@ -85,9 +99,13 @@ export function useCalibHistory(): UseCalibHistoryResult {
           overdue: dueInDays < 0,
           pending: instrument.state === '待标定' || dueInDays < 0,
           worstVerdict,
-          trend: [...rows]
-            .reverse()
-            .map((row) => ({ date: row.date, sensitivity: row.sensitivity, selfNoise: row.selfNoise })),
+          suggestReplace,
+          failedDates,
+          trend: rows.map((row) => ({
+            date: effectiveDate(row),
+            sensitivity: effectiveSensitivity(row),
+            selfNoise: effectiveSelfNoise(row),
+          })),
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);

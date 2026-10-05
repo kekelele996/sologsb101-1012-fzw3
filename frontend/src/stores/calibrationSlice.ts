@@ -7,9 +7,17 @@ import { db, createId, watchTable } from '@/utils/db';
 import type {
   Calibration,
   CalibrationFilterState,
+  RecheckInfo,
   ResponseVerdict,
 } from '@/types/calibration';
-import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from '@/types/calibration';
+import {
+  createEmptyCalibrationFilter,
+  effectiveDate,
+  effectiveSensitivity,
+  effectiveVerdict,
+  judgeCalibration,
+  sensitivityDelta,
+} from '@/types/calibration';
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
@@ -43,7 +51,7 @@ const initialState: CalibrationSliceState = {
 
 export const createCalibration = createAsyncThunk(
   'calibration/createCalibration',
-  async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict'>) => {
+  async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict' | 'recheck'>) => {
     const now = Date.now();
     const instrument = await db.instruments.get(payload.instrumentId);
     const verdict = judgeCalibration(
@@ -54,6 +62,7 @@ export const createCalibration = createAsyncThunk(
     const row: Calibration = {
       ...payload,
       responseVerdict: verdict,
+      recheck: null,
       id: createId('cal'),
       createdAt: now,
       updatedAt: now,
@@ -70,44 +79,93 @@ export const createCalibration = createAsyncThunk(
   }
 );
 
-export const updateCalibration = createAsyncThunk(
-  'calibration/updateCalibration',
-  async (payload: { id: string; patch: Partial<Calibration> }) => {
+/** 按该仪器最新一次生效标定（复检优先）的结论回写仪器状态 */
+async function syncInstrumentState(instrumentId: string, now: number): Promise<void> {
+  const own = await db.calibrations.where('instrumentId').equals(instrumentId).toArray();
+  if (own.length === 0) return;
+  const latest = [...own].sort((a, b) => effectiveDate(b).localeCompare(effectiveDate(a)))[0];
+  await db.instruments.update(instrumentId, {
+    state: effectiveVerdict(latest) === '不合格' ? '待标定' : '在用',
+    updatedAt: now,
+  } as never);
+}
+
+/** 补记 / 修改复检（每条标定至多一次复检）；复检结论按复检灵敏度与自噪自动核定 */
+export const saveCalibrationRecheck = createAsyncThunk(
+  'calibration/saveCalibrationRecheck',
+  async (
+    payload: { id: string; recheck: Omit<RecheckInfo, 'responseVerdict'> },
+    { rejectWithValue }
+  ) => {
     const existing = await db.calibrations.get(payload.id);
-    const instrument = existing ? await db.instruments.get(existing.instrumentId) : undefined;
-    const nextSensitivity = payload.patch.sensitivity ?? existing?.sensitivity ?? 0;
-    const nextNoise = payload.patch.selfNoise ?? existing?.selfNoise ?? 0;
-    const verdict = judgeCalibration(instrument?.type ?? '宽频带', nextSensitivity, nextNoise);
-    await db.calibrations.update(payload.id, {
-      ...payload.patch,
-      responseVerdict: payload.patch.responseVerdict ?? verdict,
-      updatedAt: Date.now(),
-    } as never);
-    return payload;
+    if (!existing) return rejectWithValue('标定记录不存在');
+    if (payload.recheck.date < existing.date) {
+      return rejectWithValue('复检日期不能早于标定日期');
+    }
+    const instrument = await db.instruments.get(existing.instrumentId);
+    const verdict = judgeCalibration(
+      instrument?.type ?? '宽频带',
+      payload.recheck.sensitivity,
+      payload.recheck.selfNoise
+    );
+    const now = Date.now();
+    await db.transaction('rw', [db.calibrations, db.instruments], async () => {
+      await db.calibrations.update(payload.id, {
+        recheck: { ...payload.recheck, responseVerdict: verdict },
+        updatedAt: now,
+      } as never);
+      await syncInstrumentState(existing.instrumentId, now);
+    });
+    return { id: payload.id, verdict };
+  }
+);
+
+/** 删除复检：结论恢复为初次录入时的初判，并回写仪器状态 */
+export const removeCalibrationRecheck = createAsyncThunk(
+  'calibration/removeCalibrationRecheck',
+  async (calibrationId: string) => {
+    const existing = await db.calibrations.get(calibrationId);
+    const now = Date.now();
+    await db.transaction('rw', [db.calibrations, db.instruments], async () => {
+      await db.calibrations.update(calibrationId, { recheck: null, updatedAt: now } as never);
+      if (existing) await syncInstrumentState(existing.instrumentId, now);
+    });
+    return calibrationId;
   }
 );
 
 export const removeCalibration = createAsyncThunk(
   'calibration/removeCalibration',
   async (calibrationId: string) => {
-    await db.calibrations.delete(calibrationId);
+    const existing = await db.calibrations.get(calibrationId);
+    const now = Date.now();
+    await db.transaction('rw', [db.calibrations, db.instruments], async () => {
+      await db.calibrations.delete(calibrationId);
+      if (existing) await syncInstrumentState(existing.instrumentId, now);
+    });
     return calibrationId;
   }
 );
 
-/** 批量改响应结论（标定记录台的批量操作） */
+/**
+ * 批量改响应结论（标定记录台的批量操作）。
+ * 已补记复检的记录结论以复检数据为准，不允许人工改判，自动跳过。
+ */
 export const bulkSetVerdict = createAsyncThunk(
   'calibration/bulkSetVerdict',
   async (payload: { ids: string[]; verdict: ResponseVerdict }) => {
     const now = Date.now();
+    let updated = 0;
     await db.calibrations
       .where('id')
       .anyOf(payload.ids)
       .modify((row) => {
+        if (row.recheck) return;
         row.responseVerdict = payload.verdict;
         row.updatedAt = now;
+        updated += 1;
       });
-    return payload;
+    return { ...payload, updated, skipped: payload.ids.length - updated };
   }
 );
 
@@ -206,7 +264,11 @@ const calibrationSlice = createSlice({
         state.lastReceipt = `标定记录已保存，响应结论自动初判为「${action.payload.responseVerdict}」`;
       })
       .addCase(bulkSetVerdict.fulfilled, (state, action) => {
-        state.lastReceipt = `已批量将 ${action.payload.ids.length} 条标定记录的响应结论改为「${action.payload.verdict}」`;
+        const { updated, skipped, ids, verdict } = action.payload;
+        state.lastReceipt =
+          skipped > 0
+            ? `已将 ${updated} 条未复检记录的响应结论改为「${verdict}」，${skipped} 条复检记录以复检结论为准已跳过`
+            : `已批量将 ${ids.length} 条标定记录的响应结论改为「${verdict}」`;
       })
       .addCase(transitionReplace.fulfilled, (state, action) => {
         state.lastReceipt =
@@ -282,7 +344,7 @@ export const selectReplacesOfInstrument = (
   return state.calibration.replaces.filter((row) => row.instrumentId === instrumentId);
 };
 
-/** 标定 id → 灵敏度变化（相对同仪器上一次标定） */
+/** 标定 id → 灵敏度变化（相对同仪器上一次标定，均采用复检后的生效值） */
 export const selectSensitivityDeltas = (
   state: WithCalibration
 ): Record<string, ReturnType<typeof sensitivityDelta>> => {
@@ -296,8 +358,8 @@ export const selectSensitivityDeltas = (
   grouped.forEach((list) => {
     const sorted = [...list].sort((a, b) => a.date.localeCompare(b.date));
     sorted.forEach((row, index) => {
-      const previous = index > 0 ? sorted[index - 1].sensitivity : null;
-      result[row.id] = sensitivityDelta(row.sensitivity, previous);
+      const previous = index > 0 ? effectiveSensitivity(sorted[index - 1]) : null;
+      result[row.id] = sensitivityDelta(effectiveSensitivity(row), previous);
     });
   });
   return result;
